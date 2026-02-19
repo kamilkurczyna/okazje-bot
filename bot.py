@@ -242,108 +242,354 @@ async def scrape_gratka(url: str) -> Optional[Offer]:
 
 
 async def scrape_olx(url: str) -> Optional[Offer]:
-    """OLX jest trudniejszy (JS-heavy), ale próbujemy wyciągnąć co się da z HTML."""
+    """OLX — wyciąga dane z JSON-LD i __NEXT_DATA__ w HTML."""
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=15) as client:
         resp = await client.get(url)
         resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
+    html_text = resp.text
 
-    title_tag = soup.find("h1") or soup.find("title")
-    title = title_tag.get_text(strip=True) if title_tag else "Brak tytułu"
-
-    # OLX renderuje cenę w JSON-LD
+    title = ""
     price = 0.0
-    jsonld = soup.find("script", type="application/ld+json")
-    if jsonld:
+    description = ""
+    location = ""
+    condition = ""
+    seller = ""
+    images = []
+
+    # Metoda 1: __NEXT_DATA__ (OLX używa Next.js)
+    next_data_script = soup.find("script", id="__NEXT_DATA__")
+    if next_data_script:
         try:
-            data = json.loads(jsonld.string)
-            if isinstance(data, dict) and "offers" in data:
-                price = float(data["offers"].get("price", 0))
-            elif isinstance(data, dict) and "price" in str(data):
-                price_match = re.search(r'"price"\s*:\s*"?(\d+(?:\.\d+)?)', jsonld.string)
-                if price_match:
-                    price = float(price_match.group(1))
-        except (json.JSONDecodeError, ValueError, KeyError):
-            pass
+            next_data = json.loads(next_data_script.string)
+            props = next_data.get("props", {}).get("pageProps", {})
+            ad = props.get("ad", {})
+
+            if ad:
+                title = ad.get("title", "")
+                desc_raw = ad.get("description", "")
+                description = desc_raw
+
+                # Cena
+                price_info = ad.get("price", {})
+                if isinstance(price_info, dict):
+                    price_val = price_info.get("regularPrice", {}).get("value", 0)
+                    if not price_val:
+                        price_val = price_info.get("value", 0)
+                    price = float(price_val) if price_val else 0.0
+
+                # Lokalizacja
+                loc_info = ad.get("location", {})
+                if loc_info:
+                    city = loc_info.get("cityName", "")
+                    region = loc_info.get("regionName", "")
+                    location = f"{city}, {region}" if city else region
+
+                # Stan (z parametrów)
+                params = ad.get("params", [])
+                for p in params:
+                    if p.get("key") == "state":
+                        condition = p.get("normalizedValue", p.get("value", {}).get("label", ""))
+                    # Dodaj inne parametry do opisu
+                    param_name = p.get("name", "")
+                    param_val = p.get("value", {})
+                    if isinstance(param_val, dict):
+                        param_label = param_val.get("label", "")
+                    else:
+                        param_label = str(param_val)
+                    if param_name and param_label:
+                        description += f"\n{param_name}: {param_label}"
+
+                # Sprzedawca
+                user_info = ad.get("user", {})
+                seller = user_info.get("name", "")
+
+                # Zdjęcia
+                photos = ad.get("photos", [])
+                images = [p.get("link", "") for p in photos[:8] if p.get("link")]
+                if images:
+                    description += f"\nZdjęcia: {len(images)} szt."
+
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f"OLX __NEXT_DATA__ parse error: {e}")
+
+    # Metoda 2: JSON-LD fallback
+    if not title:
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict):
+                    if data.get("@type") == "Product" or "offers" in data:
+                        title = data.get("name", "")
+                        desc_ld = data.get("description", "")
+                        if desc_ld:
+                            description = desc_ld
+                        offers = data.get("offers", {})
+                        if isinstance(offers, dict):
+                            price = float(offers.get("price", 0))
+                        img = data.get("image", [])
+                        if isinstance(img, list):
+                            images = img[:8]
+                        elif isinstance(img, str):
+                            images = [img]
+                        break
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+    # Metoda 3: HTML fallback
+    if not title:
+        title_tag = soup.find("h1") or soup.find("title")
+        title = title_tag.get_text(strip=True) if title_tag else "Brak tytułu"
 
     if price == 0:
-        price_match = re.search(r'(\d[\d\s]*(?:[.,]\d{2})?)\s*zł', resp.text)
+        price_match = re.search(r'(\d[\d\s]*(?:[.,]\d{2})?)\s*zł', html_text)
         if price_match:
             try:
                 price = float(price_match.group(1).replace(" ", "").replace(",", "."))
             except ValueError:
                 pass
 
-    desc = soup.get_text(separator="\n", strip=True)[:1000]
+    if not description:
+        description = soup.get_text(separator="\n", strip=True)[:1000]
 
     return Offer(
         url=url,
-        title=title,
+        title=title or "Brak tytułu",
         price=price,
-        description=desc,
-        location="",
+        description=description[:1500],
+        location=location,
         platform="olx.pl",
+        seller=seller,
+        condition=condition,
+        images=images,
         scraped_at=datetime.now().isoformat(),
     )
 
 
 async def scrape_allegro(url: str) -> Optional[Offer]:
-    """Allegro jest najtrudniejszy — wyciągamy co się da."""
+    """Allegro — wyciąga dane z JSON-LD i meta tagów."""
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=15) as client:
         resp = await client.get(url)
         resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    title_tag = soup.find("h1") or soup.find("title")
-    title = title_tag.get_text(strip=True) if title_tag else "Brak tytułu"
+    html_text = resp.text
 
+    title = ""
     price = 0.0
-    price_match = re.search(r'(\d[\d\s]*(?:[.,]\d{2})?)\s*zł', resp.text)
-    if price_match:
+    description = ""
+    condition = ""
+    images = []
+    seller = ""
+    location = ""
+
+    # JSON-LD
+    for script in soup.find_all("script", type="application/ld+json"):
         try:
-            price = float(price_match.group(1).replace(" ", "").replace(",", "."))
-        except ValueError:
+            data = json.loads(script.string)
+            if isinstance(data, dict):
+                if data.get("@type") == "Product" or "offers" in data:
+                    title = data.get("name", "")
+                    desc_ld = data.get("description", "")
+                    if desc_ld:
+                        description = desc_ld
+                    offers = data.get("offers", {})
+                    if isinstance(offers, dict):
+                        price = float(offers.get("price", 0))
+                        condition = offers.get("itemCondition", "")
+                        seller_info = offers.get("seller", {})
+                        if isinstance(seller_info, dict):
+                            seller = seller_info.get("name", "")
+                    img = data.get("image", [])
+                    if isinstance(img, list):
+                        images = img[:8]
+                    elif isinstance(img, str):
+                        images = [img]
+                    break
+        except (json.JSONDecodeError, ValueError):
             pass
+
+    # Meta tags fallback
+    if not title:
+        og_title = soup.find("meta", {"property": "og:title"})
+        if og_title:
+            title = og_title.get("content", "")
+    if not title:
+        title_tag = soup.find("h1") or soup.find("title")
+        title = title_tag.get_text(strip=True) if title_tag else "Brak tytułu"
+
+    if price == 0:
+        meta_price = soup.find("meta", {"property": "product:price:amount"})
+        if meta_price:
+            try:
+                price = float(meta_price["content"])
+            except (ValueError, KeyError):
+                pass
+
+    if price == 0:
+        price_match = re.search(r'(\d[\d\s]*(?:[.,]\d{2})?)\s*zł', html_text)
+        if price_match:
+            try:
+                price = float(price_match.group(1).replace(" ", "").replace(",", "."))
+            except ValueError:
+                pass
+
+    if not description:
+        # Wyciągnij co się da z body
+        description = soup.get_text(separator="\n", strip=True)[:1000]
+
+    if images:
+        description += f"\nZdjęcia: {len(images)} szt."
+
+    # Wyczyść condition z URL-a schema.org
+    if condition and "schema.org" in condition:
+        condition = condition.split("/")[-1]  # np. "UsedCondition" → "UsedCondition"
 
     return Offer(
         url=url,
-        title=title,
+        title=title or "Brak tytułu",
         price=price,
-        description=soup.get_text(separator="\n", strip=True)[:1000],
-        location="",
+        description=description[:1500],
+        location=location,
         platform="allegro.pl",
+        seller=seller,
+        condition=condition,
+        images=images,
         scraped_at=datetime.now().isoformat(),
     )
 
 
 async def scrape_vinted(url: str) -> Optional[Offer]:
-    """Vinted jest JS-heavy, ale próbujemy."""
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=15) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
+    """Vinted — używa wewnętrznego API do pobrania pełnych danych."""
+    # Wyciągnij item ID z URL
+    item_match = re.search(r'/items/(\d+)', url)
+    if not item_match:
+        # Spróbuj alternatywny format
+        item_match = re.search(r'(\d{8,})', url)
+    if not item_match:
+        return await scrape_generic(url)
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    title_tag = soup.find("h1") or soup.find("title")
-    title = title_tag.get_text(strip=True) if title_tag else "Brak tytułu"
+    item_id = item_match.group(1)
 
-    price = 0.0
-    price_match = re.search(r'(\d[\d\s]*(?:[.,]\d{2})?)\s*zł', resp.text)
-    if price_match:
-        try:
-            price = float(price_match.group(1).replace(" ", "").replace(",", "."))
-        except ValueError:
-            pass
+    # Vinted wymaga sesji — najpierw pobierz cookie
+    vinted_headers = {
+        **HEADERS,
+        "Accept": "application/json, text/plain, */*",
+    }
 
-    return Offer(
-        url=url,
-        title=title,
-        price=price,
-        description=soup.get_text(separator="\n", strip=True)[:1000],
-        location="",
-        platform="vinted.pl",
-        scraped_at=datetime.now().isoformat(),
-    )
+    try:
+        async with httpx.AsyncClient(headers=vinted_headers, follow_redirects=True, timeout=15) as client:
+            # Krok 1: Pobierz sesję z głównej strony
+            session_resp = await client.get("https://www.vinted.pl")
+            cookies = session_resp.cookies
+
+            # Krok 2: Pobierz dane z API
+            api_url = f"https://www.vinted.pl/api/v2/items/{item_id}"
+            resp = await client.get(api_url, cookies=cookies)
+
+            if resp.status_code == 200:
+                data = resp.json()
+                item = data.get("item", data)
+
+                title = item.get("title", "Brak tytułu")
+                price_str = item.get("price", {})
+                if isinstance(price_str, dict):
+                    price = float(price_str.get("amount", "0").replace(",", "."))
+                elif isinstance(price_str, str):
+                    price = float(price_str.replace(",", "."))
+                else:
+                    price = float(price_str or 0)
+
+                description = item.get("description", "")
+                brand = item.get("brand_dto", {}).get("title", "") if item.get("brand_dto") else ""
+                condition = item.get("status", "")
+                location = ""
+                user_info = item.get("user", {})
+                if user_info:
+                    city = user_info.get("city", "")
+                    country = user_info.get("country_title", "")
+                    location = f"{city}, {country}" if city else country
+                seller = user_info.get("login", "") if user_info else ""
+
+                # Zdjęcia
+                photos = item.get("photos", [])
+                images = [p.get("full_size_url", p.get("url", "")) for p in photos[:5]]
+
+                # Dodatkowe info do opisu
+                size = item.get("size_title", "")
+                color = item.get("color1", {}).get("title", "") if item.get("color1") else ""
+                catalogue = item.get("catalog_tree_title", "")
+
+                full_desc = f"{description}"
+                if brand:
+                    full_desc += f"\nMarka: {brand}"
+                if size:
+                    full_desc += f"\nRozmiar: {size}"
+                if color:
+                    full_desc += f"\nKolor: {color}"
+                if catalogue:
+                    full_desc += f"\nKategoria: {catalogue}"
+                if images:
+                    full_desc += f"\nZdjęcia: {len(images)} szt."
+
+                return Offer(
+                    url=url,
+                    title=title,
+                    price=price,
+                    description=full_desc[:1500],
+                    location=location,
+                    platform="vinted.pl",
+                    seller=seller,
+                    condition=condition,
+                    images=images,
+                    scraped_at=datetime.now().isoformat(),
+                )
+    except Exception as e:
+        logger.warning(f"Vinted API failed: {e}, falling back to HTML scrape")
+
+    # Fallback: HTML scraping (ograniczone dane)
+    try:
+        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=15) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title_tag = soup.find("h1") or soup.find("title")
+        title = title_tag.get_text(strip=True) if title_tag else "Brak tytułu"
+
+        # Szukaj ceny w meta tagach i JSON-LD
+        price = 0.0
+        # JSON-LD
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                ld = json.loads(script.string)
+                if isinstance(ld, dict) and "offers" in ld:
+                    price = float(ld["offers"].get("price", 0))
+                    break
+            except (json.JSONDecodeError, ValueError):
+                pass
+        # Meta tag
+        if price == 0:
+            meta_price = soup.find("meta", {"itemprop": "price"}) or soup.find("meta", {"property": "og:price:amount"})
+            if meta_price and meta_price.get("content"):
+                try:
+                    price = float(meta_price["content"].replace(",", "."))
+                except ValueError:
+                    pass
+
+        return Offer(
+            url=url,
+            title=title,
+            price=price,
+            description=soup.get_text(separator="\n", strip=True)[:1000],
+            location="",
+            platform="vinted.pl",
+            scraped_at=datetime.now().isoformat(),
+        )
+    except Exception as e:
+        logger.error(f"Vinted scrape failed completely: {e}")
+        return None
 
 
 async def scrape_generic(url: str) -> Optional[Offer]:
@@ -507,7 +753,8 @@ LOKALIZACJA: {offer.location}
 SPRZEDAWCA: {offer.seller}
 OPIS: {offer.description}
 URL: {offer.url}
-LICZBA ZDJĘĆ: {len(offer.images)}"""
+LICZBA ZDJĘĆ: {len(offer.images)}
+ZDJĘCIA: {', '.join(offer.images[:3]) if offer.images else 'brak URL zdjęć'}"""
 
     try:
         response = await client.messages.create(
@@ -731,13 +978,15 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         # Podsumowanie scrape'a
-        await update.message.reply_text(
-            f"📦 **{offer.title}**\n"
+        img_info = f"📷 Zdjęcia: {len(offer.images)}" if offer.images else "📷 Brak zdjęć"
+        await safe_reply(
+            update.message,
+            f"📦 {offer.title}\n"
             f"💰 Cena: {offer.price} zł\n"
             f"📍 {offer.location or 'brak lokalizacji'}\n"
-            f"📄 Stan: {offer.condition or 'nie podano'}\n\n"
+            f"📄 Stan: {offer.condition or 'nie podano'}\n"
+            f"{img_info}\n\n"
             f"🤖 Analizuję z AI...",
-
         )
 
         # AI analysis
