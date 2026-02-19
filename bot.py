@@ -574,14 +574,30 @@ def save_keywords(keywords: list[str]):
         json.dump(keywords, f, ensure_ascii=False, indent=2)
 
 
+# ── SAFE SEND HELPER ──────────────────────────────────────────────────────────
+
+async def safe_reply(message, text: str):
+    """Wyślij wiadomość — najpierw próbuj Markdown, potem plain text."""
+    try:
+        await message.reply_text(text, parse_mode="Markdown")
+    except Exception:
+        # Jeśli Markdown się nie parsuje, wyślij bez formatowania
+        clean = text.replace("**", "").replace("*", "").replace("_", "").replace("`", "")
+        try:
+            await message.reply_text(clean)
+        except Exception as e:
+            await message.reply_text(f"Błąd wysyłania: {e}")
+
+
 # ── TELEGRAM HANDLERS ────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Komenda /start."""
     chat_id = update.effective_chat.id
-    await update.message.reply_text(
-        f"🔍 **OKAZJE BOT** — Twój skaner kolekcjonerski\n\n"
-        f"📋 **Komendy:**\n"
+    await safe_reply(
+        update.message,
+        f"🔍 OKAZJE BOT — Twój skaner kolekcjonerski\n\n"
+        f"📋 Komendy:\n"
         f"• Wklej link → instant analiza AI\n"
         f"• /keywords — pokaż/edytuj słowa kluczowe\n"
         f"• /add <słowo> — dodaj słowo kluczowe\n"
@@ -589,37 +605,36 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• /scan — uruchom skan ręcznie\n"
         f"• /status — status bota\n"
         f"• /help — pomoc\n\n"
-        f"🆔 Twój Chat ID: `{chat_id}`\n"
-        f"_(wklej do zmiennej CHAT_ID w .env)_",
-        parse_mode="Markdown",
+        f"🆔 Twój Chat ID: {chat_id}\n"
+        f"(wklej do zmiennej CHAT_ID w Railway)",
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🔍 **Jak używać:**\n\n"
-        "**1. Analiza linku** — wklej link z OLX/Vinted/Allegro/Sprzedajemy/Gratka\n"
+    await safe_reply(
+        update.message,
+        "🔍 Jak używać:\n\n"
+        "1. Analiza linku — wklej link z OLX/Vinted/Allegro/Sprzedajemy/Gratka\n"
         "Bot pobierze ofertę, przeanalizuje AI i da Ci werdykt.\n\n"
-        "**2. Można wkleić wiele linków naraz** — każdy w osobnej linii.\n\n"
-        "**3. Auto-monitoring** — bot co 30 min skanuje Sprzedajemy.pl i Gratka.pl "
+        "2. Można wkleić wiele linków naraz — każdy w osobnej linii.\n\n"
+        "3. Auto-monitoring — bot skanuje Sprzedajemy.pl i Gratka.pl "
         "po Twoich słowach kluczowych i wysyła alerty o nowych ofertach.\n\n"
-        "**4. Słowa kluczowe** — /keywords, /add, /remove\n\n"
-        "**Werdykty:**\n"
+        "4. Słowa kluczowe — /keywords, /add, /remove\n\n"
+        "Werdykty:\n"
         "🟢 KUP — marża 200%+, pewny deal\n"
         "🟡 NEGOCJUJ — potencjał, ale trzeba zbić cenę\n"
         "🟠 ZBADAJ — obejrzyj osobiście\n"
         "❌ OMIŃ — replika / za drogo / brak marży",
-        parse_mode="Markdown",
     )
 
 
 async def cmd_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kw = load_keywords()
-    text = "🔑 **Słowa kluczowe do monitoringu:**\n\n"
+    text = "🔑 Słowa kluczowe do monitoringu:\n\n"
     for i, k in enumerate(kw, 1):
         text += f"{i}. {k}\n"
     text += f"\n📝 /add <słowo> — dodaj\n📝 /remove <numer lub słowo> — usuń"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await safe_reply(update.message, text)
 
 
 async def cmd_add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -633,7 +648,7 @@ async def cmd_add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     kw.append(keyword)
     save_keywords(kw)
-    await update.message.reply_text(f"✅ Dodano: **{keyword}**", parse_mode="Markdown")
+    await safe_reply(update.message, f"✅ Dodano: {keyword}")
 
 
 async def cmd_remove_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -649,7 +664,7 @@ async def cmd_remove_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if 0 <= idx < len(kw):
             removed = kw.pop(idx)
             save_keywords(kw)
-            await update.message.reply_text(f"✅ Usunięto: **{removed}**", parse_mode="Markdown")
+            await safe_reply(update.message, f"✅ Usunięto: {removed}")
             return
     except ValueError:
         pass
@@ -658,7 +673,7 @@ async def cmd_remove_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if arg in kw:
         kw.remove(arg)
         save_keywords(kw)
-        await update.message.reply_text(f"✅ Usunięto: **{arg}**", parse_mode="Markdown")
+        await safe_reply(update.message, f"✅ Usunięto: {arg}")
     else:
         await update.message.reply_text(f"Nie znaleziono '{arg}' na liście.")
 
@@ -675,7 +690,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Min marża: {MIN_MARGIN_PERCENT}%\n"
         f"• Platformy monitorowane: Sprzedajemy.pl, Gratka.pl\n"
         f"• Platformy ręczne: OLX, Vinted, Allegro, eBay",
-        parse_mode="Markdown",
+
     )
 
 
@@ -722,7 +737,7 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📍 {offer.location or 'brak lokalizacji'}\n"
             f"📄 Stan: {offer.condition or 'nie podano'}\n\n"
             f"🤖 Analizuję z AI...",
-            parse_mode="Markdown",
+
         )
 
         # AI analysis
@@ -740,9 +755,9 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         emoji = verdict_emoji.get(offer.verdict, "❓")
 
-        await update.message.reply_text(
-            f"{emoji} **ANALIZA: {offer.title[:50]}**\n\n{analysis}",
-            parse_mode="Markdown",
+        await safe_reply(
+            update.message,
+            f"{emoji} ANALIZA: {offer.title[:50]}\n\n{analysis}",
         )
 
 
@@ -770,9 +785,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 Analizuję opis z AI...")
     analysis = await analyze_offer(offer)
 
-    await update.message.reply_text(
-        f"📋 **ANALIZA OPISU:**\n\n{analysis}",
-        parse_mode="Markdown",
+    await safe_reply(
+        update.message,
+        f"📋 ANALIZA OPISU:\n\n{analysis}",
     )
 
 
@@ -824,18 +839,18 @@ async def run_scan(bot: Bot, chat_id: str) -> int:
     alert_text = f"🔔 **NOWE OFERTY** ({len(new_offers)} znalezionych)\n\n"
     for i, o in enumerate(top_offers, 1):
         alert_text += (
-            f"**{i}. {o.title[:50]}**\n"
+            f"{i}. {o.title[:50]}\n"
             f"💰 {o.price} zł | 📍 {o.platform}\n"
             f"🔗 {o.url}\n\n"
         )
 
     if len(new_offers) > 10:
-        alert_text += f"_...i {len(new_offers) - 10} więcej_\n"
+        alert_text += f"...i {len(new_offers) - 10} więcej\n"
 
     alert_text += "\n💡 Wklej interesujący link, żeby dostać pełną analizę AI."
 
     try:
-        await bot.send_message(chat_id=chat_id, text=alert_text, parse_mode="Markdown")
+        await bot.send_message(chat_id=chat_id, text=alert_text)
     except Exception as e:
         logger.error(f"Failed to send alert: {e}")
 
