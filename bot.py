@@ -548,43 +548,110 @@ async def scrape_vinted(url: str) -> Optional[Offer]:
     except Exception as e:
         logger.warning(f"Vinted API failed: {e}, falling back to HTML scrape")
 
-    # Fallback: HTML scraping (ograniczone dane)
+    # Fallback: HTML scraping — Vinted renderuje sporo w HTML
     try:
         async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=15) as client:
             resp = await client.get(url)
             resp.raise_for_status()
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        title_tag = soup.find("h1") or soup.find("title")
-        title = title_tag.get_text(strip=True) if title_tag else "Brak tytułu"
+        html_text = resp.text
 
-        # Szukaj ceny w meta tagach i JSON-LD
+        # Tytuł — szukaj h1 lub og:title
+        title = ""
+        h1 = soup.find("h1")
+        if h1:
+            title = h1.get_text(strip=True)
+        if not title:
+            og_title = soup.find("meta", {"property": "og:title"})
+            if og_title:
+                title = og_title.get("content", "")
+        if not title:
+            title_tag = soup.find("title")
+            title = title_tag.get_text(strip=True) if title_tag else "Brak tytułu"
+        # Usuń " | Vinted" z tytułu
+        title = re.sub(r'\s*\|\s*Vinted\s*$', '', title)
+
+        # Cena — szukaj wzorca "200,00 zł" w tekście strony
         price = 0.0
-        # JSON-LD
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                ld = json.loads(script.string)
-                if isinstance(ld, dict) and "offers" in ld:
-                    price = float(ld["offers"].get("price", 0))
-                    break
-            except (json.JSONDecodeError, ValueError):
-                pass
-        # Meta tag
-        if price == 0:
-            meta_price = soup.find("meta", {"itemprop": "price"}) or soup.find("meta", {"property": "og:price:amount"})
-            if meta_price and meta_price.get("content"):
+        # Najpierw szukaj ceny głównej (bez "zawiera Ochronę")
+        price_patterns = [
+            r'(\d{1,6}[.,]\d{2})\s*zł\s*\n\s*\d+[.,]\d{2}\s*zł\s*\n\s*zawiera',  # główna cena przed "zawiera Ochronę"
+            r'(\d{1,6}[.,]\d{2})\s*zł',  # ogólny pattern
+        ]
+        page_text = soup.get_text(separator="\n", strip=True)
+        for pattern in price_patterns:
+            m = re.search(pattern, page_text)
+            if m:
                 try:
-                    price = float(meta_price["content"].replace(",", "."))
+                    price = float(m.group(1).replace(",", ".").replace(" ", ""))
+                    break
                 except ValueError:
                     pass
+
+        # Opis — szukaj opisu produktu
+        description = ""
+        # Szukaj tekstu po sekcji z parametrami
+        desc_match = re.search(r'(?:Dodane|Dodano).*?\n(.+?)(?:\n(?:Wysyłka|Kup teraz|od \d))', page_text, re.DOTALL)
+        if desc_match:
+            description = desc_match.group(1).strip()
+        if not description:
+            # Szukaj dłuższych bloków tekstu
+            for text_block in page_text.split("\n"):
+                if len(text_block) > 40 and "vinted" not in text_block.lower() and "cookie" not in text_block.lower():
+                    description = text_block
+                    break
+
+        # Parametry (Stan, Materiał, Kolor)
+        params = {}
+        for label in ["Stan", "Materiał", "Kolor", "Rozmiar", "Marka"]:
+            param_match = re.search(rf'{label}\s*\n\s*(.+?)(?:\n|$)', page_text)
+            if param_match:
+                params[label] = param_match.group(1).strip()
+
+        condition = params.get("Stan", "")
+        if params:
+            description += "\n" + "\n".join(f"{k}: {v}" for k, v in params.items())
+
+        # Lokalizacja i sprzedawca
+        location = ""
+        loc_match = re.search(r'([\w\s-]+),\s*Polska', page_text)
+        if loc_match:
+            location = loc_match.group(0)
+        seller = ""
+        # Szukaj nazwy sprzedawcy (jest po awatarze)
+
+        # Zdjęcia — wyciągnij z img tagów (images1.vinted.net)
+        images = []
+        for img in soup.find_all("img"):
+            src = img.get("src", "")
+            if "images1.vinted.net" in src and "/f800/" in src:
+                if src not in images:
+                    images.append(src)
+        # Deduplikuj (Vinted powtarza zdjęcia)
+        seen_img = set()
+        unique_images = []
+        for img_url in images:
+            # Wyciągnij unikalną część URL (hash)
+            img_key = img_url.split("/f800/")[0] if "/f800/" in img_url else img_url
+            if img_key not in seen_img:
+                seen_img.add(img_key)
+                unique_images.append(img_url)
+        images = unique_images[:8]
+
+        if images:
+            description += f"\nZdjęcia: {len(images)} szt."
 
         return Offer(
             url=url,
             title=title,
             price=price,
-            description=soup.get_text(separator="\n", strip=True)[:1000],
-            location="",
+            description=description[:1500],
+            location=location,
             platform="vinted.pl",
+            seller=seller,
+            condition=condition,
+            images=images,
             scraped_at=datetime.now().isoformat(),
         )
     except Exception as e:
