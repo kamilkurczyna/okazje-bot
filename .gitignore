@@ -1,0 +1,6 @@
+.env
+okazje_data.json
+keywords.json
+__pycache__/
+*.pyc
+.DS_Store

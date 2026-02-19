@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]==21.8
+anthropic==0.40.0
+httpx==0.27.2
+beautifulsoup4==4.12.3
